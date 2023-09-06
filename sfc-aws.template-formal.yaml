@@ -1,0 +1,1206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Integration between Salesforce and AWS'
+
+Parameters:
+  SalesforceThresholdPassedEndpointUrl:
+    Type: String
+    Description: 'Salesforce Endpoint Url to post event from EventBridge, e.g.: Custom platform events -  https://<instance-name>.my.salesforce.com/services/data/v56.0/sobjects/AWS_PE__e'
+  SalesforceOauthUrl:
+    Type: String
+    Description: 'Salesforce Url for OAuth authentication, e.g.: https://<instance-name>.my.salesforce.com/services/oauth2/token'
+  SalesforceOauthClientId:
+    Type: String
+    Description: 'Salesforce Integration Application Client ID'
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 256
+    Default: '{{resolve:secretsmanager:SalesforceClientCredentials:SecretString:ClientId}}'
+  SalesforceOauthClientSecret:
+    Type: String
+    Description: 'Salesforce Integration Application Client Secret'
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 256
+    Default: '{{resolve:secretsmanager:SalesforceClientCredentials:SecretString:ClientSecret}}'
+  SalesforceUsername:
+    Type: String
+    Description: 'Username of Salesforce integration User'
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 128
+    Default: '{{resolve:secretsmanager:SalesforceUsername:SecretString:Value}}'
+  SalesforcePassword:
+    Type: String
+    Description: 'Password of Salesforce integration User'
+    NoEcho: true
+    MinLength: 1
+    MaxLength: 128
+    Default: '{{resolve:secretsmanager:SalesforcePassword:SecretString:Value}}'
+  SalesforceConnectionProfile:
+    Type: String
+    Description: AppFlow Connector Profile for Salesforce
+  SalesforcePartnerEventBusName:
+    Type: String
+    Description: 'Salesforce partner eventbus arn created from the Console. Stream salesforce events directly to Amazon EventBridge, e.g.: "aws.partner/salesforce.com/XXXXXXXXXXXXXXXXXX/XXXXXXXXXXXXXXXXXX"'
+  SalesforcePartnerEventPattern:
+    Type: String
+    Description: 'Salesforce partner event pattern interested to stream to eventbridge, e.g.: {"detail-type": ["Company_Threshold_Update__e"]}'
+
+
+Resources:
+
+  SFCEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: SFCEventBus
+
+  S3TransactionsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - S3InvokeLambdaPermission
+    Properties:
+      BucketName: !Sub "transactions-${AWS::AccountId}-${AWS::Region}"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3NotificationLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                - Name: suffix
+                  Value: .json
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+
+  S3NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3NotificationLambda
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TransactionDynamoDBTable
+          EVENT_BUS_NAME: !Ref SFCEventBus
+          THRESHOLD_PERCENT: 80
+      Role:
+        Fn::GetAtt:
+        - S3LambdaRole
+        - Arn
+      Code:
+        ZipFile: |
+          import json
+          import urllib.parse
+          import boto3
+          import os
+          from decimal import Decimal
+
+          print('Loading function')
+
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          eventbridge = boto3.client('events')
+
+          company_list = {}
+
+          def lambda_handler(event, context):
+              company_list.clear()
+              TABLE_NAME = os.environ['TABLE_NAME']
+              THRESHOLD_PERCENT = os.environ['THRESHOLD_PERCENT']
+              EVENT_BUS_NAME = os.environ['EVENT_BUS_NAME']
+
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              print("Bucket: " + bucket + "; key: " + key)
+              try:
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  data = obj['Body'].read().decode('utf-8')
+                  #print(data)
+                  for line in data.splitlines():
+                      json_data = json.loads(line[:-1])
+                      company_name = json_data["company_name"]
+                      amount = json_data["amount"]
+                      if company_name in company_list:
+                          company_list[company_name] = company_list[company_name] + amount
+                      else:
+                          company_list[company_name] = amount
+                  
+                  table = dynamodb.Table(TABLE_NAME)
+                  for cn, am in company_list.items():
+                      dbItem = table.get_item(Key={'CompanyName': cn})
+                      try:
+                          amount = dbItem['Item']['Amount'] + Decimal(am)
+                      except:
+                          amount = Decimal(am)
+                      table.put_item(Item={"CompanyName": dbItem['Item']['CompanyName'], "Threshold": dbItem['Item']['Threshold'], "Amount": Decimal(amount)})
+                      
+                      try:
+                        if (dbItem['Item']['Threshold'] * Decimal(THRESHOLD_PERCENT) / 100) < Decimal(amount):
+                            eventbridge.put_events(
+                                Entries=[
+                                    {
+                                        'Detail': '{ "CompanyName": "' + dbItem['Item']['CompanyName'] 
+                                            + '", "Threshold": "' + str(dbItem['Item']['Threshold']) 
+                                            + '", "Amount": "' + str(amount) + '" }',
+                                        'DetailType': 'transaction',
+                                        'Source': 'ThresholdPassed',
+                                        'EventBusName': EVENT_BUS_NAME
+                                    },
+                                ]
+                            )
+                            print('Event sent: { "CompanyName": "' + dbItem['Item']['CompanyName'] 
+                                            + '", "Threshold": "' + str(dbItem['Item']['Threshold']) 
+                                            + '", "Amount": "' + str(amount) + '" }')
+                      except:
+                        print("Failed with sending an event to EventBridge. Error: ")
+                        print(e)                      
+              except Exception as e:
+                  print(e)
+                  raise e
+              
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref S3NotificationLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::transactions-${AWS::AccountId}-${AWS::Region}"
+      SourceAccount: !Ref 'AWS::AccountId'
+
+
+  S3LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: '/'
+      Policies:
+      - PolicyName: S3NotificationLambdaPolicy
+        PolicyDocument:
+          Statement:
+          - Sid: S3
+            Effect: Allow
+            Action:
+              - s3:Get*
+            Resource:
+              - !Sub "arn:aws:s3:::transactions-${AWS::AccountId}-${AWS::Region}"
+              - !Sub "arn:aws:s3:::transactions-${AWS::AccountId}-${AWS::Region}/*"
+          - Sid: CloudWatchAccess
+            Effect: Allow
+            Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+          - Sid: DynamoDB
+            Effect: Allow
+            Action: ['dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:UpdateTable', 'dynamodb:GetItem']
+            Resource: '*'
+          - Sid: EventBridge
+            Effect: Allow
+            Action: ['events:PutEvents']
+            Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${SFCEventBus}"
+
+  
+
+
+
+  AWSUser:
+    Type: AWS::IAM::User
+    Properties:
+      Path: "/"
+      Policies:
+      - PolicyName: AccessToLaunchSentimentLambda
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+            - !GetAtt SentimentLambda.Arn
+          - Effect: Deny
+            Action:
+            - lambda:InvokeFunction
+            NotResource:
+            - !GetAtt SentimentLambda.Arn
+      - PolicyName: AccessToAthenaS3Glue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:GetQueryResultsStream
+              - athena:GetQueryResults
+              - athena:GetQueryExecution
+              - athena:StopQueryExecution
+              - athena:GetTableMetadata
+              - athena:ListDatabases
+              - athena:GetDataCatalog
+              - athena:ListDataCatalogs
+              - athena:ListWorkGroups
+              - athena:GetDatabase
+              - athena:ListTableMetadata
+              - glue:GetDatabases
+              - glue:GetDatabase
+              - glue:GetPartitions
+              - glue:GetPartition
+              - glue:GetTables
+              - glue:GetTable
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:GetBucketAcl
+            Resource:
+            - !Join ['', [!Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/', !Ref TransactionsGlueDB]]
+            - !Join ['', [!Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/', !Ref TransactionsGlueTable, '/*']]
+            - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:datacatalog/*"
+            - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+            - !Join ['', ['arn:aws:s3:::', !Ref S3TransactionsBucket]]
+            - !Join ['', ['arn:aws:s3:::', !Ref S3TransactionsBucket, '/*']]
+      - PolicyName: AccessToAthenaS3Output
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:ListMultipartUploadParts
+              - s3:AbortMultipartUpload
+              - s3:CreateBucket
+              - s3:PutObject
+            Resource:
+               - !Join ['', ['arn:aws:s3:::', !Ref S3AthenaBucket]]
+               - !Join ['', ['arn:aws:s3:::', !Ref S3AthenaBucket, '/*']]
+ 
+  AWSUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName:
+        !Ref AWSUser
+
+
+
+
+
+  SentimentLambdaFuntionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [lambda.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      RoleName: !Sub "SentimentLambda-role-${AWS::Region}"
+      ManagedPolicyArns: 
+      - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+      - PolicyName: TransactionLambdaFuntionExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: CloudWatchAccess
+            Effect: Allow
+            Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+          - Sid: ComprehendAccess
+            Effect: Allow
+            Action: ['comprehend:DetectSentiment']
+            Resource: '*'
+  
+  SentimentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SentimentLambda
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      MemorySize: 256
+      Timeout: 300
+      Role:
+        Fn::GetAtt:
+        - SentimentLambdaFuntionLambdaRole
+        - Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          client = boto3.client(service_name='comprehend')
+
+          def lambda_handler(event, context):
+
+            print(event)
+
+            try: 
+              mytxt = event['Statement']
+    
+              result = client.detect_sentiment(Text = mytxt, LanguageCode = 'en')
+              response = result['Sentiment']
+              return {
+                "isBase64Encoded": False,
+                "statusCode": 200,
+                "statusDescription": "200 OK",
+                "headers": {
+                  "Set-cookie": "cookies",
+                  "Content-Type": "application/json"
+                },
+                "body": response
+              }
+            except Exception as e:
+              print("Exception occurred: " + repr(e))
+              return {
+                "isBase64Encoded": False,
+                "statusCode": 400,
+                "statusDescription": "400 Failed",
+                "headers": {
+                  "Set-cookie": "cookies",
+                  "Content-Type": "application/json"
+                }
+              }
+      Description: Get sentiment from statement.
+      TracingConfig:
+        Mode: Active
+
+
+
+
+  TransactionsGlueDB:
+    Type: "AWS::Glue::Database"
+    Properties:
+      DatabaseInput:
+        Name: transactiongluedb
+      CatalogId: !Ref AWS::AccountId
+
+  TransactionsGlueTable:
+    Type: "AWS::Glue::Table"
+    Properties:
+      TableInput:
+        Name: transactions_glue_table
+        StorageDescriptor:
+          Compressed: False
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          NumberOfBuckets: -1
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Location: !Join ['', ['s3://', !Ref 'S3TransactionsBucket', '/']]
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+          - Name: account_id
+            Type: string
+          - Name: amount
+            Type: double
+          - Name: company_name
+            Type: string
+          - Name: date
+            Type: date
+          - Name: sf_id
+            Type: string
+        Parameters: {'classification': 'json'}
+      DatabaseName: !Ref TransactionsGlueDB
+      CatalogId: !Ref AWS::AccountId
+
+
+
+  S3AthenaBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - S3InvokeLambdaPermission
+    Properties:
+      BucketName: !Sub "athena-outcome-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+
+  S3AthenaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3AthenaBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+            Effect: Allow
+            Resource: 
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref S3AthenaBucket
+                  - /*
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref S3AthenaBucket
+            Principal: 
+              Service: 
+                - athena.amazonaws.com
+
+  AthenaSalesforceWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: SalesforceWorkGroup
+      Description: Salesforce WorkGroup
+      State: ENABLED
+      WorkGroupConfiguration:
+        BytesScannedCutoffPerQuery: 1000000000
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        RequesterPaysEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Join ['', ['s3://', !Ref 'S3AthenaBucket']]
+
+
+
+
+
+  TransactionDynamoDBTable: 
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - 
+          AttributeName: "CompanyName"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "CompanyName"
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: "transactionCompanyThreshold"
+
+  DynamoDBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [appsync.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: DynamoDBAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: DynamoDB
+            Effect: Allow
+            Action: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:UpdateItem', 'dynamodb:Query', 'dynamodb:Scan']
+            Resource: !GetAtt TransactionDynamoDBTable.Arn
+
+
+
+
+
+  # AppSync API - The GraphQL API for the working with DynamoDB Transactions table
+  AppSyncApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: CompanyThresholdApi
+      XrayEnabled: true
+      AuthenticationType: API_KEY
+
+  # API Key for external access
+  AppSyncApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+
+  # AppSync Schema
+  AppSyncSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Definition: |
+        type CompanyThreshold {
+          CompanyName: ID!
+          Threshold: Int
+        }
+        type PaginatedCompanyThresholds {
+          companyThresholds: [CompanyThreshold!]!
+          nextToken: String
+        }
+        type Query {
+          allCompanyThresholds(limit: Int, nextToken: String): PaginatedCompanyThresholds!
+          getCompanyThreshold(CompanyName: ID!): CompanyThreshold
+        }
+        type Mutation {
+          saveCompanyThreshold(CompanyName: ID!, Threshold: Int!): CompanyThreshold
+          deleteCompanyThreshold(CompanyName: ID!): CompanyThreshold
+        }
+        type Schema {
+          query: Query
+          mutation: Mutation
+        }
+
+  # AppSync Data Source for DynamoDB
+  AppSyncCompanyThresholdTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      Name: CompanyThresholdDataSource
+      ApiId: !GetAtt AppSyncApi.ApiId
+      Description: "The Company Threshold Table AppSync Data Source"
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt DynamoDBRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref TransactionDynamoDBTable
+        AwsRegion: !Sub ${AWS::Region}
+
+  # Resolver: Query - Get All Company Thresholds
+  AppSyncAllNotesQueryResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: allCompanyThresholds
+      DataSourceName: !GetAtt AppSyncCompanyThresholdTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Scan",
+          "limit": $util.defaultIfNull(${ctx.args.limit},20),
+          "nextToken": $util.toJson(${ctx.args.nextToken})
+        }
+      ResponseMappingTemplate: |
+        {
+          "companyThresholds": $util.toJson($ctx.result.items),
+          "nextToken": $util.toJson(${ctx.args.nextToken})
+        }
+
+  # Resolver: Query - get one Company Threshold
+  AppSyncGetNoteQueryResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Query
+      FieldName: getCompanyThreshold
+      DataSourceName: !GetAtt AppSyncCompanyThresholdTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2018-05-29",
+          "operation": "GetItem",
+          "key": {
+            "CompanyName": $util.dynamodb.toDynamoDBJson($ctx.args.CompanyName)
+          }
+        }
+      ResponseMappingTemplate: "$util.toJson($ctx.result)"
+
+  # Resolver: Mutation - Save Company Threshold
+  AppSyncSaveCompanyThresholdMutationResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: saveCompanyThreshold
+      DataSourceName: !GetAtt AppSyncCompanyThresholdTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2018-05-29",
+          "operation": "UpdateItem",
+          "key": {
+            "CompanyName": $util.dynamodb.toDynamoDBJson($ctx.args.CompanyName)
+          },
+          "attributeValues": {
+            "Threshold": $util.dynamodb.toDynamoDBJson($ctx.args.Threshold)
+          }
+        }
+      ResponseMappingTemplate: "$util.toJson($ctx.result)"
+
+  # Resolver: Mutations - Delete Company Threshold
+  AppSyncDeleteNoteMutationResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: AppSyncSchema
+    Properties:
+      ApiId: !GetAtt AppSyncApi.ApiId
+      TypeName: Mutation
+      FieldName: deleteCompanyThreshold
+      DataSourceName: !GetAtt AppSyncCompanyThresholdTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2018-05-29",
+          "operation": "DeleteItem",
+          "key": {
+            "CompanyName": $util.dynamodb.toDynamoDBJson($ctx.args.CompanyName)
+          }
+        }
+      ResponseMappingTemplate: "$util.toJson($ctx.result)"
+
+
+
+  UpdateDynamoDBLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UpdateDynamoDBLambda
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      MemorySize: 256
+      Timeout: 300
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TransactionDynamoDBTable
+      Role:
+        Fn::GetAtt:
+        - UpdateDynamoDBLambdaRole
+        - Arn
+      Code:
+        ZipFile: |
+          import json
+          import urllib.parse
+          import boto3
+          import os
+          from decimal import Decimal
+
+          print('Loading function')
+
+          dynamodb = boto3.resource('dynamodb')
+
+          company_list = {}
+
+          def lambda_handler(event, context):
+              print(event)
+              company_name = event['detail']['payload']['CompanyName__c']
+              threshold = event['detail']['payload']['Threshold__c']
+              TABLE_NAME = os.environ['TABLE_NAME']
+              am = 0
+              try:
+                  table = dynamodb.Table(TABLE_NAME)
+                  dbItem = table.get_item(Key={'CompanyName': company_name})
+                  if 'Item' in response:
+                    am = dbItem['Item']['Amount']
+  
+                  table.put_item(Item={"CompanyName": company_name, "Threshold": threshold, "Amount": Decimal(am)})
+                      
+              except Exception as e:
+                  print(e)
+                  raise e
+              
+  UpdateDynamoDBLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: '/'
+      Policies:
+      - PolicyName: UpdateDynamoDBLambdaPolicy
+        PolicyDocument:
+          Statement:
+          - Sid: CloudWatchAccess
+            Effect: Allow
+            Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+          - Sid: DynamoDB
+            Effect: Allow
+            Action: ['dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:UpdateTable', 'dynamodb:GetItem']
+            Resource: '*'
+
+
+
+
+  # EventBridge rule to stream salesforce events directly to Amazon EventBridge.
+  SalesforceEventDeliveryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Stream salesforce events directly to Amazon EventBridge"
+      EventBusName: !Ref SalesforcePartnerEventBusName
+      EventPattern: !Ref SalesforcePartnerEventPattern
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt UpdateDynamoDBLambda.Arn
+          Id: UpdateDynamoDBLambda
+          DeadLetterConfig:
+            Arn: !GetAtt SalesforceEventDeliveryDLQ.Arn
+
+  # Permission for EventBridge to invoke Lambda
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdateDynamoDBLambda
+      Principal: events.amazonaws.com
+      Action: lambda:InvokeFunction
+      SourceArn: !GetAtt SalesforceEventDeliveryRule.Arn
+
+  # DLQ for case processor events that could not be sent to Salesforce
+  SalesforceEventDeliveryDLQ:
+    Type: AWS::SQS::Queue
+
+  SalesforceEventDeliveryDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt SalesforceEventDeliveryDLQ.Arn
+      Queues:
+        - Ref: SalesforceEventDeliveryDLQ
+
+
+
+
+
+  # EventBridge rule to send passing threshold event to Salesforce
+  ThresholdPassedEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "EventBridge rule to send passing threshold event to Salesforce"
+      EventBusName: !Ref SFCEventBus
+      EventPattern:
+        source:
+          - "ThresholdPassed"
+        account:
+          - !Ref AWS::AccountId
+      State: "ENABLED"
+      Targets:
+        # Cloudwatch target
+        - Arn: !GetAtt ApiDestinationEventsToSFLogGroup.Arn
+          Id: LogTarget
+        # API Destination target
+        -
+          Id: SalesforceAPIDestination
+          RoleArn: !GetAtt EventbridgeAPIDestinationRole.Arn
+          Arn: !GetAtt SalesforceDestination.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt ThresholdPassedAPIDestinationDLQ.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 10
+          InputTransformer:
+            InputPathsMap:
+              {
+                "CompanyName": "$.detail.CompanyName",
+                "Amount": "$.detail.Amount",
+                "Threshold": "$.detail.Threshold"
+              }
+            InputTemplate: '{"CompanyName__c":<CompanyName>,"Threshold__c":<Threshold>,"Amount__c":<Amount>}'
+
+  # API Destination Log group to capture EventBridge events sent to Salesforce
+  ApiDestinationEventsToSFLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: 'ApiDestinationEventsToSFLogGroup'
+      RetentionInDays: 7
+  
+  # IAM Resource Policy to allow EventBridge to push events to CloudWatch
+  LogGroupForEventsPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: EventBridgeToCWLogsPolicy
+      PolicyDocument: !Sub >
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "EventBridgetoCWLogsCreateLogStreamPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:CreateLogStream"
+              ],
+              "Resource": [
+                "${ApiDestinationEventsToSFLogGroup.Arn}"
+              ]
+            },
+            {
+              "Sid": "EventBridgetoCWLogsPutLogEventsPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                "${ApiDestinationEventsToSFLogGroup.Arn}"
+              ],
+              "Condition": {
+                "ArnEquals": {"AWS:SourceArn": ["${ThresholdPassedEventRule.Arn}"]}
+              }
+            }
+          ]
+        }
+
+  # API Destination IAM Permissions
+  EventbridgeAPIDestinationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole      
+      Policies:
+        - PolicyName: AllowAPIDestinationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'events:InvokeApiDestination'
+                Resource: [!GetAtt SalesforceDestination.Arn]
+
+  # Establishing Connection to Salesforce Account
+  SalesforceConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name: !Sub "auth0-connection-${AWS::AccountId}-${AWS::Region}"
+      Description: 'My connection with Salesforce through OAuth'
+      AuthorizationType: OAUTH_CLIENT_CREDENTIALS
+      AuthParameters:
+        OAuthParameters:
+          AuthorizationEndpoint: !Ref SalesforceOauthUrl
+          ClientParameters:
+            ClientID: !Ref SalesforceOauthClientId
+            ClientSecret: !Ref SalesforceOauthClientSecret
+          HttpMethod: POST
+          OAuthHttpParameters:
+            BodyParameters:
+              - Key: 'grant_type'
+                Value: 'password'
+                IsValueSecret: 'false'
+              - Key: 'username'
+                Value: !Ref SalesforceUsername
+                IsValueSecret: 'true'
+              - Key: 'password'
+                Value: !Ref SalesforcePassword
+                IsValueSecret: 'true'
+
+  # API Destination to SalesForce
+  SalesforceDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      Name: 'SalesforceAPIDestination'
+      ConnectionArn:
+        Fn::GetAtt: [ SalesforceConnection, Arn ]
+      InvocationEndpoint: !Ref SalesforceThresholdPassedEndpointUrl
+      HttpMethod: POST
+      InvocationRateLimitPerSecond: 10
+
+  # DLQ for threshold passed events that could not be sent to Salesforce
+  ThresholdPassedAPIDestinationDLQ:
+    Type: AWS::SQS::Queue
+
+  ThresholdPassedAPIDestinationDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt ThresholdPassedAPIDestinationDLQ.Arn
+      Queues:
+        - Ref: ThresholdPassedAPIDestinationDLQ
+
+
+
+
+
+  S3AppFlowBucket:
+    Type: AWS::S3::Bucket  
+    Properties:
+      BucketName: !Sub "appflow-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "AES256"
+
+  S3CustomResourceUploadInitialFileForAppFlow:
+    Type: Custom::S3CustomResource
+    Properties:
+      ServiceToken: !GetAtt AWSLambdaFunctionForUploadingDataToS3.Arn
+      the_bucket: !Ref S3AppFlowBucket
+  
+  AWSLambdaFunctionForUploadingDataToS3:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Upload file to S3"
+      FunctionName: !Sub 'UploadToS3-${AWS::StackName}-${AWS::Region}-lambda'
+      Handler: index.handler
+      Role: !GetAtt AWSLambdaForUploadingDataToS3ExecutionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3AppFlowBucket
+      Timeout: 360
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          import csv
+          def handler(event, context):
+
+              the_event = event['RequestType']
+              print("The event is: ", str(the_event))
+              s3 = boto3.client('s3')
+              response_data = {}
+              # Retrieve parameters
+              bucket = os.environ['BUCKET_NAME']
+              try:
+                if the_event in ('Create', 'Update'):
+                  file_name = "AccountInformation.csv"
+                  s3_path = "source/" + file_name
+                  
+                  header = ['AccountId', 'AccountName', 'AccountAddress']
+                  data = [('123', 'XPower', 'Tel Aviv, Yigal Alon 148'),
+                          ('456', 'Adi Corp.', 'Tel Aviv, Yigal Alon 126')]
+
+                  with open('/tmp/' + file_name, 'w', newline='') as f:
+                      writer = csv.writer(f)
+                      writer.writerow(header)
+                      writer.writerows(data)
+
+                  s3.upload_file('/tmp/' + file_name, bucket, s3_path)
+                elif the_event == 'Delete':
+                    print("Deleting S3 content...")
+                    b_operator = boto3.resource('s3')
+                    b_operator.Bucket(str(bucket)).objects.all().delete()
+                # Everything OK... send the signal back
+                print("Operation successful!")
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print("Operation failed...")
+                  print(str(e))
+                  response_data['Data'] = str(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+  
+  AWSLambdaForUploadingDataToS3ExecutionRole:
+     Type: AWS::IAM::Role
+     Properties:
+       AssumeRolePolicyDocument:
+         Statement:
+         - Action:
+           - sts:AssumeRole
+           Effect: Allow
+           Principal:
+             Service:
+             - lambda.amazonaws.com
+         Version: '2012-10-17'
+       Path: "/"
+       Policies:
+       - PolicyDocument:
+           Statement:
+           - Action:
+             - logs:CreateLogGroup
+             - logs:CreateLogStream
+             - logs:PutLogEvents
+             Effect: Allow
+             Resource: arn:aws:logs:*:*:*
+           Version: '2012-10-17'
+         PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambdaForUploadingDataToS3-CW
+       - PolicyDocument:
+           Statement:
+           - Action:
+             - s3:PutObject
+             - s3:DeleteObject
+             - s3:List*
+             Effect: Allow
+             Resource:
+             - !Sub arn:aws:s3:::${S3AppFlowBucket}/*
+             - !Sub arn:aws:s3:::${S3AppFlowBucket}
+           Version: '2012-10-17'
+         PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambdaForUploadingDataToS3-S3
+       RoleName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambdaForUploadingDataToS3ExecutionRole
+
+  S3AppFlowBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn:
+      - S3CustomResourceUploadInitialFileForAppFlow
+    Properties:
+      Bucket: !Ref S3AppFlowBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 's3:GetObject'
+              - 's3:ListBucket'
+            Effect: Allow
+            Resource: 
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref S3AppFlowBucket
+                  - /*
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref S3AppFlowBucket
+            Principal: 
+              Service: 
+                - appflow.amazonaws.com
+
+  # SalesforceConnectionProfile:
+  #   Type: AWS::AppFlow::ConnectorProfile
+  #   Properties: 
+  #     ConnectorProfileName: SalesforceConnectionProfile
+  #     ConnectorType: Salesforce
+  #     ConnectionMode: Public
+  #     ConnectorProfileConfig:
+  #       ConnectorProfileProperties:
+  #         Salesforce:
+  #           InstanceUrl: !Ref SalesforceAppFlowResourceUrl
+  #           IsSandboxEnvironment: false 
+  #       ConnectorProfileCredentials:
+  #         Salesforce:
+  #           ClientCredentialsArn: !Ref SaleforceClientCredentials
+  #           ConnectorOAuthRequest: 
+  #             AuthCode: !FindInMap [ EnvMap, !Ref Env, SalesForceAuthCode]
+  #             RedirectUri: !Ref SalesforceAppFlowResourceUrl
+
+  AppFlowFromS3ToSalesforce:
+    Type: AWS::AppFlow::Flow
+    DependsOn:
+      - S3AppFlowBucketPolicy
+    Properties:
+      FlowName: S3ToSalesforceFlow
+      Description: Flow for moving data from S3 to Salesforce
+      TriggerConfig:
+        TriggerType: OnDemand
+      SourceFlowConfig:
+        ConnectorType: S3
+        SourceConnectorProperties:
+          S3:
+            BucketName: !Ref S3AppFlowBucket
+            BucketPrefix: source
+      DestinationFlowConfigList:
+        - ConnectorType: Salesforce
+          ConnectorProfileName: !Ref SalesforceConnectionProfile
+          DestinationConnectorProperties:
+            Salesforce:
+              Object: Account
+              IdFieldNames: 
+                - ID__c
+              WriteOperationType: UPSERT
+      Tasks:
+        - TaskType: Filter
+          SourceFields:
+            - AccountId
+            - AccountName
+            - AccountAddress
+          ConnectorOperator:
+            S3: PROJECTION
+        - TaskType: Map
+          SourceFields:
+            - AccountId
+          TaskProperties:
+            - Key: SOURCE_DATA_TYPE
+              Value: String
+            - Key: DESTINATION_DATA_TYPE
+              Value: String
+          DestinationField: ID__c
+          ConnectorOperator:
+            S3: NO_OP
+        - TaskType: Map
+          SourceFields:
+            - AccountName
+          TaskProperties:
+            - Key: SOURCE_DATA_TYPE
+              Value: String
+            - Key: DESTINATION_DATA_TYPE
+              Value: String
+          DestinationField: Name
+          ConnectorOperator:
+            S3: NO_OP
+        - TaskType: Map
+          SourceFields:
+            - AccountAddress
+          TaskProperties:
+            - Key: SOURCE_DATA_TYPE
+              Value: string
+            - Key: DESTINATION_DATA_TYPE
+              Value: string
+          DestinationField: Account_Type__c
+          ConnectorOperator:
+            S3: NO_OP
+
+
+
+
+Outputs:
+
+  AWSUserAccessKey:
+    Description: AWS User Access Key for Sentiment invocation and Athena access.
+    Value: !Ref AWSUserAccessKey
+
+  AWSUserAccessSecret:
+    Description: AWS User Access Secret for Sentiment invocation and Athena access.
+    Value: !GetAtt AWSUserAccessKey.SecretAccessKey
+
+  TransactionsRawLocation:
+    Description: S3 Transactions Raw location.
+    Value: !Join ['', ['s3://', !Ref 'S3TransactionsBucket']]
+
+  GlueDatabsae:
+    Description: Glue Table.
+    Value: !Ref TransactionsGlueTable
+
+  GraphQLApiEndpoint:
+    Description: The URL to the GraphQL Endpoint
+    Value: !GetAtt AppSyncApi.GraphQLUrl
+
+  AppSyncAPIKey:
+    Description: API Key for using the GraphQL endpoint. (header key name 'x-api-key')
+    Value: !GetAtt AppSyncApiKey.ApiKey
+
+  AthenaSalesforceWorkgroup:
+    Description: Athena Workgroup to be used for querying Athena
+    Value: !Ref AthenaSalesforceWorkGroup
+  
+  SentimentLambda:
+    Description: Lambda ARN to run Sentiment analysis
+    Value: !GetAtt SentimentLambda.Arn
