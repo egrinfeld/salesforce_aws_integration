@@ -1,1 +1,1 @@
-For instruction open Salesforce and AWS guidelines.pdf file
+For instructions open Salesforce and AWS guidelines.pdf file
